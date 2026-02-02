@@ -1,47 +1,63 @@
-import yfinance as yf
-import requests
+import os
 import time
+import requests
+import yfinance as yf
 import pytz
 import feedparser
 from datetime import datetime, timedelta
 
 # ======================
-# CONFIG
+# ENV CONFIG (MANDATORY)
 # ======================
 
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+EIA_API_KEY = os.getenv("EIA_API_KEY")
 
-EIA_API_KEY = "2p1LLWxmZDIwah88hTzU7vl8UP2VX8rUzD7yIOVa"
+if not BOT_TOKEN or not CHAT_ID or not EIA_API_KEY:
+    raise RuntimeError("❌ Missing ENV variables (BOT_TOKEN / CHAT_ID / EIA_API_KEY)")
+
+# ======================
+# SETTINGS
+# ======================
 
 SYMBOL = "CL=F"
 TZ = pytz.timezone("Asia/Kolkata")
 
-VOLATILITY_THRESHOLD = 0.6  # % move
-NEWS_CHECK_INTERVAL = 300  # 5 min
-
-# Inventory expectations (editable weekly)
+VOLATILITY_THRESHOLD = 0.6
 EXPECTED_EIA = -2.0
 EXPECTED_API = -1.5
+
+NEWS_URL = "https://feeds.reuters.com/reuters/energyNews"
+NEWS_KEYWORDS = [
+    "oil", "pipeline", "refinery", "opec",
+    "sanctions", "middle east", "attack",
+    "export", "war", "supply"
+]
+
+last_news_time = datetime.now(TZ) - timedelta(hours=1)
 
 # ======================
 # TELEGRAM
 # ======================
 
 def send(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e)
 
 # ======================
-# PRICE
+# PRICE FUNCTIONS
 # ======================
 
 def get_price():
     data = yf.Ticker(SYMBOL).history(period="1d", interval="1m")
     return round(data["Close"].iloc[-1], 2)
 
-def pct_change(p1, p2):
-    return round(((p2 - p1) / p1) * 100, 2)
+def pct_change(a, b):
+    return round(((b - a) / a) * 100, 2)
 
 # ======================
 # BIAS ENGINE
@@ -52,11 +68,10 @@ def bias_engine(expected, actual):
         return "📈 Bullish (Supply Tightening)"
     elif actual > expected:
         return "📉 Bearish (Supply Increase)"
-    else:
-        return "⚖️ Neutral"
+    return "⚖️ Neutral"
 
 # ======================
-# EIA ACTUAL DATA (REAL)
+# EIA DATA (REAL)
 # ======================
 
 def fetch_eia_actual():
@@ -70,7 +85,7 @@ def fetch_eia_actual():
         "&sort[0][direction]=desc"
         "&length=1"
     )
-    r = requests.get(url).json()
+    r = requests.get(url, timeout=10).json()
     return round(r["response"]["data"][0]["value"], 2)
 
 # ======================
@@ -78,97 +93,84 @@ def fetch_eia_actual():
 # ======================
 
 def run_inventory(event, expected):
-    now = datetime.now(TZ).strftime("%d %b %Y | %I:%M %p IST")
+    try:
+        now = datetime.now(TZ).strftime("%d %b %Y | %I:%M %p IST")
+        pre = get_price()
 
-    pre = get_price()
-    send(f"🛢️ {event} RELEASE\nTime: {now}\nPre Price: {pre}")
+        send(f"🛢️ {event} RELEASE\nTime: {now}\nPre Price: {pre}")
 
-    time.sleep(300)
-    p5 = get_price()
-    vol = pct_change(pre, p5)
+        time.sleep(300)
+        p5 = get_price()
+        vol = pct_change(pre, p5)
 
-    if abs(vol) >= VOLATILITY_THRESHOLD:
-        send(f"⚠️ Volatility Spike\nMove: {vol}% (5 min)")
+        if abs(vol) >= VOLATILITY_THRESHOLD:
+            send(f"⚠️ Volatility Spike\nMove: {vol}% (5 min)")
 
-    time.sleep(600)
-    p15 = get_price()
+        time.sleep(300)
+        p15 = get_price()
 
-    actual = fetch_eia_actual() if event == "EIA Inventory" else expected
+        actual = fetch_eia_actual() if event == "EIA Inventory" else expected
+        bias = bias_engine(expected, actual)
 
-    bias = bias_engine(expected, actual)
+        send(
+            f"📊 {event} SUMMARY\n\n"
+            f"Expected: {expected}M\n"
+            f"Actual: {actual}M\n\n"
+            f"Pre: {pre}\n5m: {p5}\n15m: {p15}\n\n"
+            f"Bias: {bias}"
+        )
 
-    send(
-        f"📊 {event} SUMMARY\n\n"
-        f"Expected: {expected}M\n"
-        f"Actual: {actual}M\n\n"
-        f"Pre: {pre}\n5m: {p5}\n15m: {p15}\n\n"
-        f"Bias: {bias}"
-    )
-
-# ======================
-# SCHEDULED EVENTS
-# ======================
-
-def scheduled_events(now):
-    # API – Tuesday 8 PM IST
-    if now.weekday() == 1 and now.hour == 20 and now.minute == 0:
-        run_inventory("API Inventory", EXPECTED_API)
-        time.sleep(3600)
-
-    # EIA – Wednesday 8 PM IST
-    if now.weekday() == 2 and now.hour == 20 and now.minute == 0:
-        run_inventory("EIA Inventory", EXPECTED_EIA)
-        time.sleep(3600)
-
-    # OPEC Placeholder Alert
-    if now.weekday() == 0 and now.hour == 17 and now.minute == 0:
-        send("⏰ OPEC EVENT TODAY\nExpect crude volatility")
+    except Exception as e:
+        send(f"❌ {event} error: {e}")
 
 # ======================
-# GEOPOLITICAL & EMERGENCY NEWS
+# NEWS MONITOR
 # ======================
-
-KEYWORDS = [
-    "oil", "pipeline", "refinery", "OPEC",
-    "sanctions", "Middle East", "attack",
-    "export", "war", "supply"
-]
-
-NEWS_URL = "https://feeds.reuters.com/reuters/energyNews"
-
-last_news_time = datetime.now(TZ) - timedelta(hours=1)
 
 def check_news():
     global last_news_time
-    feed = feedparser.parse(NEWS_URL)
 
-    for entry in feed.entries[:5]:
-        published = datetime(*entry.published_parsed[:6], tzinfo=pytz.UTC).astimezone(TZ)
+    try:
+        feed = feedparser.parse(NEWS_URL)
 
-        if published > last_news_time:
-            headline = entry.title.lower()
+        for entry in feed.entries[:5]:
+            published = datetime(*entry.published_parsed[:6], tzinfo=pytz.UTC).astimezone(TZ)
 
-            if any(k.lower() in headline for k in KEYWORDS):
-                send(
-                    f"🚨 GEO / EMERGENCY NEWS\n\n"
-                    f"{entry.title}\n\n"
-                    f"⚠️ Crude Impact Possible"
-                )
-                last_news_time = published
+            if published > last_news_time:
+                headline = entry.title.lower()
+
+                if any(k in headline for k in NEWS_KEYWORDS):
+                    send(f"🚨 GEO / EMERGENCY NEWS\n\n{entry.title}")
+                    last_news_time = published
+
+    except Exception as e:
+        print("News error:", e)
 
 # ======================
-# MAIN LOOP
+# SCHEDULER
 # ======================
 
-def main():
+def scheduler():
     send("🚀 Crude Master Bot LIVE (IST)")
 
     while True:
         now = datetime.now(TZ)
 
-        scheduled_events(now)
-        check_news()
+        # API – Tuesday 8 PM IST
+        if now.weekday() == 1 and now.hour == 20 and now.minute == 0:
+            run_inventory("API Inventory", EXPECTED_API)
+            time.sleep(3600)
 
+        # EIA – Wednesday 8 PM IST
+        if now.weekday() == 2 and now.hour == 20 and now.minute == 0:
+            run_inventory("EIA Inventory", EXPECTED_EIA)
+            time.sleep(3600)
+
+        # OPEC Reminder
+        if now.weekday() == 0 and now.hour == 17 and now.minute == 0:
+            send("⏰ OPEC EVENT TODAY – Expect crude volatility")
+
+        check_news()
         time.sleep(30)
 
 # ======================
@@ -176,4 +178,4 @@ def main():
 # ======================
 
 if __name__ == "__main__":
-    main()
+    scheduler()

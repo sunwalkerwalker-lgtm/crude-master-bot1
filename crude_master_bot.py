@@ -9,9 +9,8 @@ import pytz
 # ======================
 import os
 
-BOT_TOKEN = os.getenv("8395308259:AAE5Jo6PabYbWvdteRHojoBSTR0mdyHA7QM")
-CHAT_ID = os.getenv("661470370")
-
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL = "CL=F"
 TZ = pytz.timezone("Asia/Kolkata")
@@ -113,3 +112,4 @@ def scheduler():
 # ======================
 if __name__ == "__main__":
     scheduler()
+

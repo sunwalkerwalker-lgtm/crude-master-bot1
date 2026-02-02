@@ -1,3 +1,6 @@
 yfinance
-pytz
 requests
+pytz
+feedparser
+
+

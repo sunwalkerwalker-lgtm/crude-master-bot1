@@ -1,115 +1,93 @@
-import yfinance as yf
-import requests
+import os
 import time
 from datetime import datetime
-import pytz
+import requests
 
-# ======================
-# CONFIG
-# ======================
-import os
+# ==============================
+# ENVIRONMENT VARIABLES
+# ==============================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ==============================
+# INVENTORY DATA (UPDATE WEEKLY)
+# ==============================
+PREVIOUS_INVENTORY = 455.2   # Million Barrels (last week)
+CURRENT_INVENTORY = 452.1    # Million Barrels (this week)
 
-SYMBOL = "CL=F"
-TZ = pytz.timezone("Asia/Kolkata")
+# ==============================
+# TELEGRAM FUNCTION
+# ==============================
+def send_message(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text
+    }
+    requests.post(url, json=payload)
 
-# Inventory expectations (can be edited weekly)
-EXPECTED_EIA = -2.0   # million barrels
-EXPECTED_API = -1.5  # million barrels
+# ==============================
+# INVENTORY ANALYSIS
+# ==============================
+def analyze_inventory():
+    change = CURRENT_INVENTORY - PREVIOUS_INVENTORY
 
-VOLATILITY_THRESHOLD = 0.6  # % move in 5 minutes
-
-# ======================
-# TELEGRAM
-# ======================
-def send(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
-
-# ======================
-# PRICE FETCH
-# ======================
-def get_price():
-    data = yf.Ticker(SYMBOL).history(period="1d", interval="1m")
-    return round(data["Close"].iloc[-1], 2)
-
-# ======================
-# VOLATILITY CHECK
-# ======================
-def check_volatility(p1, p2):
-    return round(((p2 - p1) / p1) * 100, 2)
-
-# ======================
-# BIAS ENGINE
-# ======================
-def bias_engine(expected, actual):
-    if actual < expected:
-        return "📈 Bullish Surprise (Supply Tightening)"
-    elif actual > expected:
-        return "📉 Bearish Surprise (Supply Increase)"
+    if change < 0:
+        return (
+            "🛢️ EIA CRUDE INVENTORY REPORT\n\n"
+            f"Result: DRAW 🟢\n"
+            f"Change: {abs(change):.2f} Million Barrels\n"
+            "Bias: BULLISH"
+        )
+    elif change > 0:
+        return (
+            "🛢️ EIA CRUDE INVENTORY REPORT\n\n"
+            f"Result: BUILD 🔴\n"
+            f"Change: +{change:.2f} Million Barrels\n"
+            "Bias: BEARISH"
+        )
     else:
-        return "⚖️ Neutral / Noise"
+        return (
+            "🛢️ EIA CRUDE INVENTORY REPORT\n\n"
+            "Result: NO CHANGE ⚪"
+        )
 
-# ======================
-# EVENT HANDLER
-# ======================
-def run_event(event_name, expected):
-    now = datetime.now(TZ).strftime("%d %b %Y | %I:%M %p IST")
+# ==============================
+# BOT START MESSAGE
+# ==============================
+send_message("🚀 Crude Master Bot LIVE (IST)")
 
-    pre_price = get_price()
-    send(f"🛢️ {event_name} Triggered\nTime: {now}\nPre-Event Price: {pre_price}")
-
-    time.sleep(300)  # 5 min
-    price_5m = get_price()
-    vol = check_volatility(pre_price, price_5m)
-
-    if abs(vol) >= VOLATILITY_THRESHOLD:
-        send(f"⚠️ Volatility Spike Detected\nMove: {vol}% in 5 min")
-
-    time.sleep(600)  # 15 min total
-    price_15m = get_price()
-
-    # Simulated actual value (replace with real API later)
-    actual_inventory = round(expected + (vol * -1), 2)
-
-    bias = bias_engine(expected, actual_inventory)
-
-    send(
-        f"📊 {event_name} Reaction (IST)\n\n"
-        f"Expected: {expected}M\n"
-        f"Actual: {actual_inventory}M\n\n"
-        f"Pre: {pre_price}\n"
-        f"5m: {price_5m}\n"
-        f"15m: {price_15m}\n\n"
-        f"Bias: {bias}"
-    )
-
-# ======================
-# SCHEDULER LOOP
-# ======================
-def scheduler():
-    send("🚀 Crude Master Bot LIVE (IST)")
-
+# ==============================
+# MAIN LOOP
+# ==============================
+try:
     while True:
-        now = datetime.now(TZ)
+        now = datetime.now()
 
-        # API – Tuesday 8:00 PM IST
-        if now.weekday() == 1 and now.hour == 20 and now.minute == 0:
-            run_event("API Inventory", EXPECTED_API)
-            time.sleep(3600)
+        # --------------------------
+        # MARKET OPEN ALERT
+        # --------------------------
+        if now.hour == 9 and now.minute == 0:
+            send_message("📈 Crude Market OPEN (IST)")
+            time.sleep(60)
 
-        # EIA – Wednesday 8:00 PM IST
+        # --------------------------
+        # EIA INVENTORY ALERT
+        # Wednesday 8:00 PM IST
+        # --------------------------
         if now.weekday() == 2 and now.hour == 20 and now.minute == 0:
-            run_event("EIA Inventory", EXPECTED_EIA)
-            time.sleep(3600)
+            inventory_msg = analyze_inventory()
+            send_message(inventory_msg)
+            time.sleep(60)
+
+        # --------------------------
+        # MARKET CLOSE ALERT
+        # --------------------------
+        if now.hour == 23 and now.minute == 30:
+            send_message("📉 Crude Market CLOSE (IST)")
+            time.sleep(60)
 
         time.sleep(30)
 
-# ======================
-# RUN
-# ======================
-if __name__ == "__main__":
-    scheduler()
-
+except Exception as e:
+    send_message(f"❌ Crude Master Bot CRASHED\nError: {str(e)}")

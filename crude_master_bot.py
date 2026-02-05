@@ -4,6 +4,7 @@ import time
 import pytz
 import feedparser
 import os
+import pandas as pd
 from datetime import datetime, timedelta
 
 # ======================
@@ -15,7 +16,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 EIA_API_KEY = os.getenv("EIA_API_KEY")
 
 if not BOT_TOKEN or not CHAT_ID or not EIA_API_KEY:
-    raise RuntimeError("❌ Missing ENV variables")
+    raise RuntimeError("❌ Missing ENV variables (BOT_TOKEN / CHAT_ID / EIA_API_KEY)")
 
 # ======================
 # CONFIG
@@ -27,14 +28,18 @@ TZ = pytz.timezone("Asia/Kolkata")
 EXPECTED_API = -1.5
 EXPECTED_EIA = -2.0
 
-VOL_5M_THRESHOLD = 0.6
-VOL_1H_THRESHOLD = 1.2
+VOL_5M_THRESHOLD = 0.5
+VOL_1H_THRESHOLD = 1.0
+
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
 NEWS_URL = "https://feeds.reuters.com/reuters/energyNews"
 
 NEWS_KEYWORDS = [
-    "oil", "OPEC", "pipeline", "refinery", "sanctions",
-    "Middle East", "attack", "export", "war", "supply"
+    "oil", "OPEC", "pipeline", "refinery",
+    "sanctions", "Middle East", "attack",
+    "export", "war", "supply", "strike"
 ]
 
 # ======================
@@ -46,7 +51,7 @@ def send(msg):
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 # ======================
-# PRICE HELPERS
+# PRICE DATA
 # ======================
 
 def get_price(interval="1m", period="1d"):
@@ -56,18 +61,34 @@ def pct(p1, p2):
     return round(((p2 - p1) / p1) * 100, 2)
 
 # ======================
+# RSI CALCULATION
+# ======================
+
+def calculate_rsi(data, period=14):
+    delta = data.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
+
+# ======================
 # SESSION ALERTS
 # ======================
 
 def session_alerts(now):
     if now.hour == 6 and now.minute == 0:
-        send("🌏 ASIA SESSION OPEN\nLow liquidity → false moves possible")
+        send("🌏 ASIA SESSION OPEN\nLow liquidity → false breakouts possible")
 
     if now.hour == 13 and now.minute == 30:
-        send("🇪🇺 EUROPE SESSION OPEN\nTrend continuation / reversals")
+        send("🇪🇺 EUROPE SESSION OPEN\nWatch trend continuation")
 
     if now.hour == 18 and now.minute == 30:
-        send("🇺🇸 US SESSION OPEN\n⚠️ High liquidity + stop hunts")
+        send("🇺🇸 US SESSION OPEN\n⚠️ High volatility window")
 
 # ======================
 # VOLATILITY ENGINE
@@ -90,18 +111,51 @@ def check_1h_volatility():
 
     if abs(move) >= VOL_1H_THRESHOLD and (now - last_1h_alert).seconds > 3600:
         send(
-            f"⚠️ ABNORMAL 1H MOVE\n\n"
+            f"⚠️ 1H VOLATILITY ALERT\n\n"
             f"Move: {move}%\n"
             f"Price: {round(last,2)}\n\n"
-            f"Likely Causes:\n"
-            f"• Session liquidity\n"
-            f"• Stop run\n"
-            f"• Headline risk"
+            f"Possible Reasons:\n"
+            f"• Session liquidity shift\n"
+            f"• Stop hunt\n"
+            f"• Headline driven move"
         )
         last_1h_alert = now
 
 # ======================
-# EIA DATA
+# RSI ALERTS
+# ======================
+
+last_rsi_alert = None
+
+def check_rsi():
+    global last_rsi_alert
+
+    data = get_price(interval="15m", period="3d")
+    rsi = calculate_rsi(data["Close"])
+
+    price = data["Close"].iloc[-1]
+    now = datetime.now(TZ)
+
+    if rsi >= RSI_OVERBOUGHT and last_rsi_alert != "OB":
+        send(
+            f"📉 RSI OVERBOUGHT ALERT\n\n"
+            f"RSI: {round(rsi,1)}\n"
+            f"Price: {round(price,2)}\n\n"
+            f"⚠️ Pullback / consolidation risk"
+        )
+        last_rsi_alert = "OB"
+
+    elif rsi <= RSI_OVERSOLD and last_rsi_alert != "OS":
+        send(
+            f"📈 RSI OVERSOLD ALERT\n\n"
+            f"RSI: {round(rsi,1)}\n"
+            f"Price: {round(price,2)}\n\n"
+            f"⚠️ Short covering bounce possible"
+        )
+        last_rsi_alert = "OS"
+
+# ======================
+# EIA ACTUAL DATA
 # ======================
 
 def fetch_eia_actual():
@@ -124,28 +178,6 @@ def bias(expected, actual):
     elif actual > expected:
         return "📉 Bearish (Supply Build)"
     return "⚖️ Neutral"
-
-# ======================
-# INVENTORY EVENTS
-# ======================
-
-def inventory_event(name, expected, is_eia=False):
-    pre = get_price()["Close"].iloc[-1]
-    send(f"🛢️ {name} RELEASE\nPre Price: {round(pre,2)}")
-
-    time.sleep(900)
-
-    post = get_price()["Close"].iloc[-1]
-    actual = fetch_eia_actual() if is_eia else expected
-
-    send(
-        f"📊 {name} SUMMARY\n\n"
-        f"Expected: {expected}M\n"
-        f"Actual: {actual}M\n\n"
-        f"Pre: {round(pre,2)}\n"
-        f"Post: {round(post,2)}\n\n"
-        f"Bias: {bias(expected, actual)}"
-    )
 
 # ======================
 # NEWS SCANNER
@@ -174,10 +206,11 @@ def daily_brief():
     send(
         f"🛢️ CRUDE MARKET BRIEF (IST)\n\n"
         f"WTI: {round(price,2)}\n\n"
-        f"Key Focus:\n"
-        f"• Inventory expectations\n"
+        f"Watchlist:\n"
+        f"• Inventory data\n"
         f"• OPEC headlines\n"
-        f"• US session volatility"
+        f"• US session volatility\n"
+        f"• RSI extremes"
     )
 
 # ======================
@@ -190,32 +223,26 @@ def main():
     last_brief_day = None
 
     while True:
-        now = datetime.now(TZ)
+        try:
+            now = datetime.now(TZ)
 
-        session_alerts(now)
-        check_1h_volatility()
-        check_news()
+            session_alerts(now)
+            check_1h_volatility()
+            check_rsi()
+            check_news()
 
-        # Daily brief at 9 AM IST
-        if now.hour == 9 and now.minute == 0 and last_brief_day != now.date():
-            daily_brief()
-            last_brief_day = now.date()
+            if now.hour == 9 and now.minute == 0 and last_brief_day != now.date():
+                daily_brief()
+                last_brief_day = now.date()
 
-        # Inventory warnings
-        if now.weekday() == 2 and now.hour == 19 and now.minute == 30:
-            send("⏰ EIA INVENTORY IN 30 MIN\nRisk management advised")
+            if now.weekday() == 2 and now.hour == 19 and now.minute == 30:
+                send("⏰ EIA INVENTORY IN 30 MIN\nRisk management advised")
 
-        # API inventory
-        if now.weekday() == 1 and now.hour == 20 and now.minute == 0:
-            inventory_event("API Inventory", EXPECTED_API)
-            time.sleep(3600)
+            time.sleep(30)
 
-        # EIA inventory
-        if now.weekday() == 2 and now.hour == 20 and now.minute == 0:
-            inventory_event("EIA Inventory", EXPECTED_EIA, True)
-            time.sleep(3600)
-
-        time.sleep(30)
+        except Exception as e:
+            send(f"⚠️ BOT ERROR\n{str(e)}")
+            time.sleep(60)
 
 # ======================
 # RUN

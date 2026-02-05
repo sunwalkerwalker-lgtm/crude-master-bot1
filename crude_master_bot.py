@@ -7,58 +7,103 @@ import os
 from datetime import datetime, timedelta
 
 # ======================
-# ENV VALIDATION
+# ENV CHECK
 # ======================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 EIA_API_KEY = os.getenv("EIA_API_KEY")
 
 if not BOT_TOKEN or not CHAT_ID or not EIA_API_KEY:
-    raise RuntimeError("❌ Missing ENV variables (BOT_TOKEN / CHAT_ID / EIA_API_KEY)")
+    raise RuntimeError("❌ Missing ENV variables")
 
 # ======================
 # CONFIG
 # ======================
+
 SYMBOL = "CL=F"
 TZ = pytz.timezone("Asia/Kolkata")
 
-EXPECTED_EIA = -2.0
 EXPECTED_API = -1.5
+EXPECTED_EIA = -2.0
 
-VOLATILITY_THRESHOLD = 0.6
-NEWS_CHECK_INTERVAL = 300
+VOL_5M_THRESHOLD = 0.6
+VOL_1H_THRESHOLD = 1.2
+
+NEWS_URL = "https://feeds.reuters.com/reuters/energyNews"
+
+NEWS_KEYWORDS = [
+    "oil", "OPEC", "pipeline", "refinery", "sanctions",
+    "Middle East", "attack", "export", "war", "supply"
+]
 
 # ======================
 # TELEGRAM
 # ======================
+
 def send(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 # ======================
-# PRICE ENGINE
+# PRICE HELPERS
 # ======================
-def get_price():
-    data = yf.Ticker(SYMBOL).history(period="1d", interval="1m")
-    return round(data["Close"].iloc[-1], 2)
 
-def pct_change(p1, p2):
+def get_price(interval="1m", period="1d"):
+    return yf.Ticker(SYMBOL).history(interval=interval, period=period)
+
+def pct(p1, p2):
     return round(((p2 - p1) / p1) * 100, 2)
 
 # ======================
-# BIAS ENGINE
+# SESSION ALERTS
 # ======================
-def bias_engine(expected, actual):
-    if actual < expected:
-        return "📈 Bullish (Supply Tightening)"
-    elif actual > expected:
-        return "📉 Bearish (Supply Increase)"
-    else:
-        return "⚖️ Neutral"
+
+def session_alerts(now):
+    if now.hour == 6 and now.minute == 0:
+        send("🌏 ASIA SESSION OPEN\nLow liquidity → false moves possible")
+
+    if now.hour == 13 and now.minute == 30:
+        send("🇪🇺 EUROPE SESSION OPEN\nTrend continuation / reversals")
+
+    if now.hour == 18 and now.minute == 30:
+        send("🇺🇸 US SESSION OPEN\n⚠️ High liquidity + stop hunts")
 
 # ======================
-# EIA ACTUAL DATA
+# VOLATILITY ENGINE
 # ======================
+
+last_1h_alert = datetime.now(TZ) - timedelta(hours=2)
+
+def check_1h_volatility():
+    global last_1h_alert
+
+    data = get_price(interval="1h", period="2d")
+    if len(data) < 2:
+        return
+
+    prev = data["Close"].iloc[-2]
+    last = data["Close"].iloc[-1]
+    move = pct(prev, last)
+
+    now = datetime.now(TZ)
+
+    if abs(move) >= VOL_1H_THRESHOLD and (now - last_1h_alert).seconds > 3600:
+        send(
+            f"⚠️ ABNORMAL 1H MOVE\n\n"
+            f"Move: {move}%\n"
+            f"Price: {round(last,2)}\n\n"
+            f"Likely Causes:\n"
+            f"• Session liquidity\n"
+            f"• Stop run\n"
+            f"• Headline risk"
+        )
+        last_1h_alert = now
+
+# ======================
+# EIA DATA
+# ======================
+
 def fetch_eia_actual():
     url = (
         "https://api.eia.gov/v2/petroleum/stocks/data/"
@@ -73,96 +118,38 @@ def fetch_eia_actual():
     r = requests.get(url).json()
     return round(r["response"]["data"][0]["value"], 2)
 
+def bias(expected, actual):
+    if actual < expected:
+        return "📈 Bullish (Supply Tightening)"
+    elif actual > expected:
+        return "📉 Bearish (Supply Build)"
+    return "⚖️ Neutral"
+
 # ======================
-# INVENTORY EVENT
+# INVENTORY EVENTS
 # ======================
-def run_inventory(event, expected):
-    now = datetime.now(TZ).strftime("%d %b %Y | %I:%M %p IST")
 
-    pre = get_price()
-    send(f"🛢️ {event} RELEASE\nTime: {now}\nPre Price: {pre}")
+def inventory_event(name, expected, is_eia=False):
+    pre = get_price()["Close"].iloc[-1]
+    send(f"🛢️ {name} RELEASE\nPre Price: {round(pre,2)}")
 
-    time.sleep(300)
-    p5 = get_price()
-    vol = pct_change(pre, p5)
+    time.sleep(900)
 
-    if abs(vol) >= VOLATILITY_THRESHOLD:
-        send(f"⚠️ Volatility Spike\nMove: {vol}% (5 min)")
-
-    time.sleep(600)
-    p15 = get_price()
-
-    actual = fetch_eia_actual() if event == "EIA Inventory" else expected
-    bias = bias_engine(expected, actual)
+    post = get_price()["Close"].iloc[-1]
+    actual = fetch_eia_actual() if is_eia else expected
 
     send(
-        f"📊 {event} SUMMARY\n\n"
+        f"📊 {name} SUMMARY\n\n"
         f"Expected: {expected}M\n"
         f"Actual: {actual}M\n\n"
-        f"Pre: {pre}\n5m: {p5}\n15m: {p15}\n\n"
-        f"Bias: {bias}"
+        f"Pre: {round(pre,2)}\n"
+        f"Post: {round(post,2)}\n\n"
+        f"Bias: {bias(expected, actual)}"
     )
 
 # ======================
-# DAILY MARKET BRIEF
+# NEWS SCANNER
 # ======================
-last_brief_date = None
-
-def daily_market_brief(now):
-    global last_brief_date
-
-    if now.hour == 9 and now.minute == 0:
-        if last_brief_date != now.date():
-            price = get_price()
-            send(
-                f"🛢️ CRUDE MARKET BRIEF (IST)\n\n"
-                f"WTI Price: {price}\n"
-                f"Key Focus:\n"
-                f"• Inventory expectations\n"
-                f"• OPEC headlines\n"
-                f"• US session volatility"
-            )
-            last_brief_date = now.date()
-
-# ======================
-# SCHEDULED ALERTS
-# ======================
-alert_guard = set()
-
-def scheduled_alerts(now):
-    key = f"{now.date()}-{now.hour}-{now.minute}"
-    if key in alert_guard:
-        return
-
-    # API Reminder
-    if now.weekday() == 1 and now.hour == 19 and now.minute == 30:
-        send("⏰ API INVENTORY IN 30 MIN\nExpect volatility")
-        alert_guard.add(key)
-
-    # EIA Reminder
-    if now.weekday() == 2 and now.hour == 19 and now.minute == 30:
-        send("⏰ EIA INVENTORY IN 30 MIN\nRisk management advised")
-        alert_guard.add(key)
-
-    # OPEC Watch
-    if now.weekday() == 0 and now.hour == 10 and now.minute == 0:
-        send("🛢️ OPEC WATCH TODAY\nStatements can move crude anytime")
-        alert_guard.add(key)
-
-    # US Session Open
-    if now.hour == 18 and now.minute == 30:
-        send("🇺🇸 US SESSION OPEN\nLiquidity + Directional moves possible")
-        alert_guard.add(key)
-
-# ======================
-# GEO NEWS
-# ======================
-NEWS_URL = "https://feeds.reuters.com/reuters/energyNews"
-KEYWORDS = [
-    "oil", "pipeline", "refinery", "OPEC",
-    "sanctions", "export", "war", "attack",
-    "supply", "Middle East"
-]
 
 last_news_time = datetime.now(TZ) - timedelta(hours=1)
 
@@ -170,34 +157,62 @@ def check_news():
     global last_news_time
     feed = feedparser.parse(NEWS_URL)
 
-    for entry in feed.entries[:5]:
-        published = datetime(*entry.published_parsed[:6], tzinfo=pytz.UTC).astimezone(TZ)
+    for e in feed.entries[:5]:
+        published = datetime(*e.published_parsed[:6], tzinfo=pytz.UTC).astimezone(TZ)
+
         if published > last_news_time:
-            headline = entry.title.lower()
-            if any(k.lower() in headline for k in KEYWORDS):
-                send(f"🚨 CRUDE RISK ALERT\n\n{entry.title}")
+            if any(k.lower() in e.title.lower() for k in NEWS_KEYWORDS):
+                send(f"🚨 ENERGY HEADLINE\n\n{e.title}")
                 last_news_time = published
+
+# ======================
+# DAILY BRIEF
+# ======================
+
+def daily_brief():
+    price = get_price()["Close"].iloc[-1]
+    send(
+        f"🛢️ CRUDE MARKET BRIEF (IST)\n\n"
+        f"WTI: {round(price,2)}\n\n"
+        f"Key Focus:\n"
+        f"• Inventory expectations\n"
+        f"• OPEC headlines\n"
+        f"• US session volatility"
+    )
 
 # ======================
 # MAIN LOOP
 # ======================
+
 def main():
     send("🚀 Crude Master Bot LIVE (IST)")
+
+    last_brief_day = None
 
     while True:
         now = datetime.now(TZ)
 
-        daily_market_brief(now)
-        scheduled_alerts(now)
+        session_alerts(now)
+        check_1h_volatility()
         check_news()
 
-        # Inventory Releases
+        # Daily brief at 9 AM IST
+        if now.hour == 9 and now.minute == 0 and last_brief_day != now.date():
+            daily_brief()
+            last_brief_day = now.date()
+
+        # Inventory warnings
+        if now.weekday() == 2 and now.hour == 19 and now.minute == 30:
+            send("⏰ EIA INVENTORY IN 30 MIN\nRisk management advised")
+
+        # API inventory
         if now.weekday() == 1 and now.hour == 20 and now.minute == 0:
-            run_inventory("API Inventory", EXPECTED_API)
+            inventory_event("API Inventory", EXPECTED_API)
             time.sleep(3600)
 
+        # EIA inventory
         if now.weekday() == 2 and now.hour == 20 and now.minute == 0:
-            run_inventory("EIA Inventory", EXPECTED_EIA)
+            inventory_event("EIA Inventory", EXPECTED_EIA, True)
             time.sleep(3600)
 
         time.sleep(30)
@@ -205,5 +220,6 @@ def main():
 # ======================
 # RUN
 # ======================
+
 if __name__ == "__main__":
     main()

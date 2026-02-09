@@ -4,7 +4,6 @@ import time
 import pytz
 import feedparser
 import os
-import numpy as np
 from datetime import datetime, timedelta
 
 # ======================
@@ -16,7 +15,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 EIA_API_KEY = os.getenv("EIA_API_KEY")
 
 if not BOT_TOKEN or not CHAT_ID or not EIA_API_KEY:
-    raise RuntimeError("❌ Missing ENV variables (BOT_TOKEN / CHAT_ID / EIA_API_KEY)")
+    raise RuntimeError("❌ Missing ENV variables")
 
 # ======================
 # CONFIG
@@ -28,15 +27,28 @@ TZ = pytz.timezone("Asia/Kolkata")
 EXPECTED_API = -1.5
 EXPECTED_EIA = -2.0
 
+VOL_5M_THRESHOLD = 0.6
 VOL_1H_THRESHOLD = 1.2
-RSI_PERIOD = 14
+
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
 NEWS_URL = "https://feeds.reuters.com/reuters/energyNews"
 
 NEWS_KEYWORDS = [
     "oil", "OPEC", "pipeline", "refinery", "sanctions",
-    "Middle East", "attack", "export", "war", "supply"
+    "Middle East", "attack", "export", "war", "supply",
+    "fed", "rates", "inflation"
 ]
+
+# ======================
+# STATE MEMORY
+# ======================
+
+last_session_alert = None
+last_1h_alert = datetime.now(TZ) - timedelta(hours=2)
+last_news_time = datetime.now(TZ) - timedelta(hours=1)
+last_risk_alert = None
 
 # ======================
 # TELEGRAM
@@ -47,67 +59,53 @@ def send(msg):
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 # ======================
-# STATE MEMORY
+# DATA HELPERS
 # ======================
 
-last_session_alert = {"asia": None, "europe": None, "us": None}
-last_false_breakout = datetime.now(TZ) - timedelta(hours=2)
-last_trend_alert = datetime.now(TZ) - timedelta(hours=2)
-last_1h_vol_alert = datetime.now(TZ) - timedelta(hours=2)
-last_news_time = datetime.now(TZ) - timedelta(hours=1)
-
-# ======================
-# PRICE HELPERS
-# ======================
-
-def get_price(interval="1h", period="2d"):
+def get_data(interval, period):
     return yf.Ticker(SYMBOL).history(interval=interval, period=period)
 
-def pct(p1, p2):
-    return round(((p2 - p1) / p1) * 100, 2)
+def pct(a, b):
+    return round(((b - a) / a) * 100, 2)
 
 # ======================
-# RSI CALC
+# TECHNICALS
 # ======================
 
-def calculate_rsi(close, period=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-
-    rs = avg_gain / avg_loss
+def calculate_rsi(data, period=14):
+    delta = data.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(period).mean()
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
 
 # ======================
-# SESSION ALERTS
+# SESSION ALERTS (NO DUPES)
 # ======================
 
 def session_alerts(now):
-    today = now.date()
+    global last_session_alert
 
-    if now.hour == 6 and now.minute == 0 and last_session_alert["asia"] != today:
-        send("🌏 ASIA SESSION OPEN\nLow liquidity → false breakouts possible")
-        last_session_alert["asia"] = today
+    session = None
+    if now.hour == 6 and now.minute == 0:
+        session = "🌏 ASIA SESSION OPEN"
+    elif now.hour == 13 and now.minute == 30:
+        session = "🇪🇺 EUROPE SESSION OPEN"
+    elif now.hour == 18 and now.minute == 30:
+        session = "🇺🇸 US SESSION OPEN"
 
-    if now.hour == 13 and now.minute == 30 and last_session_alert["europe"] != today:
-        send("🇪🇺 EUROPE SESSION OPEN\nTrend continuation / reversal zone")
-        last_session_alert["europe"] = today
-
-    if now.hour == 18 and now.minute == 30 and last_session_alert["us"] != today:
-        send("🇺🇸 US SESSION OPEN\n⚠️ High volatility + stop hunts")
-        last_session_alert["us"] = today
+    if session and session != last_session_alert:
+        send(f"{session}\nLiquidity conditions changing ⚠️")
+        last_session_alert = session
 
 # ======================
-# 1H VOLATILITY
+# VOLATILITY ENGINE
 # ======================
 
-def check_1h_volatility():
-    global last_1h_vol_alert
+def check_volatility():
+    global last_1h_alert
 
-    data = get_price()
+    data = get_data("1h", "2d")
     if len(data) < 2:
         return
 
@@ -117,98 +115,95 @@ def check_1h_volatility():
 
     now = datetime.now(TZ)
 
-    if abs(move) >= VOL_1H_THRESHOLD and (now - last_1h_vol_alert).seconds > 3600:
+    if abs(move) >= VOL_1H_THRESHOLD and (now - last_1h_alert).seconds > 3600:
         send(
             f"⚠️ ABNORMAL 1H MOVE\n\n"
             f"Move: {move}%\n"
             f"Price: {round(last,2)}\n\n"
-            f"Likely Cause:\n"
-            f"• Liquidity grab\n"
-            f"• News reaction\n"
-            f"• Inventory positioning"
+            f"Possible Causes:\n"
+            f"• Macro headline\n"
+            f"• Liquidity sweep\n"
+            f"• Event positioning"
         )
-        last_1h_vol_alert = now
+        last_1h_alert = now
 
 # ======================
-# FALSE BREAKOUT DETECTION
+# RSI + TREND + REVERSAL
 # ======================
 
-def false_breakout_detection():
-    global last_false_breakout
-
-    data = get_price(period="3d")
-    if len(data) < 20:
-        return
-
-    now = datetime.now(TZ)
-    if (now - last_false_breakout).seconds < 3600:
-        return
-
-    recent_high = data["High"].iloc[-20:-1].max()
-    recent_low = data["Low"].iloc[-20:-1].min()
-
-    last_close = data["Close"].iloc[-1]
-    last_high = data["High"].iloc[-1]
-    last_low = data["Low"].iloc[-1]
-
-    if last_high > recent_high and last_close < recent_high:
-        send(
-            f"🚨 FALSE BREAKOUT (UPSIDE)\n\n"
-            f"Liquidity grab above resistance\n"
-            f"Price rejected back into range\n\n"
-            f"Level: {round(recent_high,2)}"
-        )
-        last_false_breakout = now
-
-    elif last_low < recent_low and last_close > recent_low:
-        send(
-            f"🚨 FALSE BREAKOUT (DOWNSIDE)\n\n"
-            f"Stop hunt below support\n"
-            f"Price reclaimed range\n\n"
-            f"Level: {round(recent_low,2)}"
-        )
-        last_false_breakout = now
-
-# ======================
-# TREND REVERSAL ALERT
-# ======================
-
-def trend_reversal_alert():
-    global last_trend_alert
-
-    data = get_price(period="5d")
-    if len(data) < 30:
-        return
-
-    now = datetime.now(TZ)
-    if (now - last_trend_alert).seconds < 3600:
-        return
-
+def check_technicals():
+    data = get_data("5m", "1d")
     close = data["Close"]
-    rsi = calculate_rsi(close, RSI_PERIOD)
 
-    last_rsi = rsi.iloc[-1]
-    prev_rsi = rsi.iloc[-2]
+    rsi = calculate_rsi(close).iloc[-1]
 
-    # Bullish reversal
-    if prev_rsi < 30 and last_rsi > 32:
+    ema20 = close.ewm(span=20).mean().iloc[-1]
+    ema50 = close.ewm(span=50).mean().iloc[-1]
+    price = close.iloc[-1]
+
+    # RSI
+    if rsi > RSI_OVERBOUGHT:
+        send(f"🔴 RSI OVERBOUGHT\nRSI: {round(rsi,1)}")
+    elif rsi < RSI_OVERSOLD:
+        send(f"🟢 RSI OVERSOLD\nRSI: {round(rsi,1)}")
+
+    # Trend Reversal
+    if price > ema20 and ema20 > ema50:
+        send("📈 TREND SHIFT BULLISH\nStructure flipped up")
+    elif price < ema20 and ema20 < ema50:
+        send("📉 TREND SHIFT BEARISH\nStructure flipped down")
+
+# ======================
+# FALSE BREAKOUT
+# ======================
+
+def false_breakout():
+    data = get_data("5m", "1d")
+    high = data["High"].iloc[-2]
+    last = data["Close"].iloc[-1]
+
+    if last < high:
         send(
-            f"🔄 TREND REVERSAL SIGNAL\n\n"
-            f"Bullish momentum shift\n"
-            f"RSI: {round(last_rsi,1)}\n\n"
-            f"Watch for higher lows"
+            "⚠️ FALSE BREAKOUT DETECTED\n"
+            "Price rejected after liquidity grab"
         )
-        last_trend_alert = now
 
-    # Bearish reversal
-    elif prev_rsi > 70 and last_rsi < 68:
+# ======================
+# RISK OFF WARNING
+# ======================
+
+def risk_off_alert():
+    global last_risk_alert
+
+    vix = yf.Ticker("^VIX").history(period="1d")["Close"].iloc[-1]
+    now = datetime.now(TZ)
+
+    if vix > 20 and last_risk_alert != now.date():
         send(
-            f"🔄 TREND REVERSAL SIGNAL\n\n"
-            f"Bearish momentum shift\n"
-            f"RSI: {round(last_rsi,1)}\n\n"
-            f"Watch for lower highs"
+            "🚨 RISK OFF ENVIRONMENT\n\n"
+            "• Volatility rising\n"
+            "• Algo driven moves likely\n"
+            "• Protect positions"
         )
-        last_trend_alert = now
+        last_risk_alert = now.date()
+
+# ======================
+# EIA DATA
+# ======================
+
+def fetch_eia_actual():
+    url = (
+        "https://api.eia.gov/v2/petroleum/stocks/data/"
+        f"?api_key={EIA_API_KEY}"
+        "&frequency=weekly"
+        "&data[0]=value"
+        "&facets[series]=WCESTUS1"
+        "&sort[0][column]=period"
+        "&sort[0][direction]=desc"
+        "&length=1"
+    )
+    r = requests.get(url).json()
+    return round(r["response"]["data"][0]["value"], 2)
 
 # ======================
 # NEWS SCANNER
@@ -231,14 +226,14 @@ def check_news():
 # ======================
 
 def daily_brief():
-    price = get_price()["Close"].iloc[-1]
+    price = get_data("1m", "1d")["Close"].iloc[-1]
     send(
-        f"🛢️ CRUDE MARKET BRIEF (IST)\n\n"
+        f"🛢️ CRUDE MARKET BRIEF\n\n"
         f"WTI: {round(price,2)}\n\n"
         f"Focus Today:\n"
+        f"• US session liquidity\n"
         f"• Inventory positioning\n"
-        f"• False breakouts\n"
-        f"• US session volatility"
+        f"• Headline risk"
     )
 
 # ======================
@@ -246,24 +241,25 @@ def daily_brief():
 # ======================
 
 def main():
-    send("🚀 Crude Master Bot LIVE (IST)")
+    send("🚀 Crude Master Bot LIVE")
 
-    last_brief_day = None
+    last_brief = None
 
     while True:
         now = datetime.now(TZ)
 
         session_alerts(now)
-        check_1h_volatility()
-        false_breakout_detection()
-        trend_reversal_alert()
+        check_volatility()
+        check_technicals()
+        false_breakout()
+        risk_off_alert()
         check_news()
 
-        if now.hour == 9 and now.minute == 0 and last_brief_day != now.date():
+        if now.hour == 9 and now.minute == 0 and last_brief != now.date():
             daily_brief()
-            last_brief_day = now.date()
+            last_brief = now.date()
 
-        time.sleep(30)
+        time.sleep(60)
 
 # ======================
 # RUN

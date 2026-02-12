@@ -10,30 +10,27 @@ from datetime import datetime, timedelta
 # ======================
 # ENV CHECK
 # ======================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 EIA_API_KEY = os.getenv("EIA_API_KEY")
 
 if not BOT_TOKEN or not CHAT_ID or not EIA_API_KEY:
-    raise RuntimeError("❌ Missing ENV variables (BOT_TOKEN / CHAT_ID / EIA_API_KEY)")
+    raise RuntimeError("❌ Missing ENV variables")
 
 # ======================
 # CONFIG
 # ======================
-
 SYMBOL = "CL=F"
 TZ = pytz.timezone("Asia/Kolkata")
 
 EXPECTED_API = -1.5
 EXPECTED_EIA = -2.0
 
-VOL_1H_THRESHOLD = 1.2
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
+VOL_1H_THRESHOLD = 1.3   # catches NFP-type candles
 
 NEWS_URL = "https://feeds.reuters.com/reuters/energyNews"
-
 NEWS_KEYWORDS = [
     "oil", "OPEC", "pipeline", "refinery", "sanctions",
     "Middle East", "attack", "export", "war", "supply"
@@ -42,22 +39,20 @@ NEWS_KEYWORDS = [
 # ======================
 # STATE (ANTI-SPAM)
 # ======================
-
 state = {
-    "asia_alerted": False,
-    "eu_alerted": False,
-    "us_alerted": False,
-    "last_1h_vol": None,
-    "last_rsi_alert": None,
-    "false_level": None,
-    "false_break_time": None,
-    "last_news_time": datetime.now(TZ) - timedelta(hours=2),
+    "asia": False,
+    "eu": False,
+    "us": False,
+    "last_rsi": None,
+    "last_1h": None,
+    "false_break": None,
+    "last_news": datetime.now(TZ) - timedelta(hours=2),
+    "macro_lock": False
 }
 
 # ======================
 # TELEGRAM
 # ======================
-
 def send(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
@@ -65,7 +60,6 @@ def send(msg):
 # ======================
 # DATA HELPERS
 # ======================
-
 def get_data(interval="1m", period="2d"):
     return yf.Ticker(SYMBOL).history(interval=interval, period=period)
 
@@ -75,45 +69,55 @@ def pct(a, b):
 # ======================
 # RSI
 # ======================
-
-def compute_rsi(series, period=14):
+def rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
+    rs = gain.rolling(period).mean() / loss.rolling(period).mean()
     return 100 - (100 / (1 + rs))
 
 # ======================
-# SESSION ALERTS (ONCE)
+# SESSION ALERTS
 # ======================
-
 def session_alerts(now):
-    if now.hour == 6 and not state["asia_alerted"]:
+    if now.hour == 6 and not state["asia"]:
         send("🌏 ASIA SESSION OPEN\nLow liquidity → fake moves possible")
-        state["asia_alerted"] = True
+        state["asia"] = True
 
-    if now.hour == 13 and not state["eu_alerted"]:
+    if now.hour == 13 and not state["eu"]:
         send("🇪🇺 EUROPE SESSION OPEN\nTrend continuation / reversals")
-        state["eu_alerted"] = True
+        state["eu"] = True
 
-    if now.hour == 18 and not state["us_alerted"]:
-        send("🇺🇸 US SESSION OPEN\n⚠️ High volatility & stop hunts")
-        state["us_alerted"] = True
+    if now.hour == 18 and not state["us"]:
+        send("🇺🇸 US SESSION OPEN\n⚠️ High volatility window")
+        state["us"] = True
 
     if now.hour == 0:
-        state["asia_alerted"] = state["eu_alerted"] = state["us_alerted"] = False
+        state["asia"] = state["eu"] = state["us"] = False
 
 # ======================
-# 1H VOLATILITY (WHY YOU MISSED MOVE)
+# RSI ALERT
 # ======================
+def rsi_alert():
+    data = get_data("15m", "3d")
+    r = rsi(data["Close"]).iloc[-1]
+    now = datetime.now(TZ)
 
+    if r >= RSI_OVERBOUGHT:
+        if not state["last_rsi"] or now - state["last_rsi"] > timedelta(hours=2):
+            send(f"📈 RSI OVERBOUGHT\nRSI: {round(r,2)}\nUpside exhaustion risk")
+            state["last_rsi"] = now
+
+    if r <= RSI_OVERSOLD:
+        if not state["last_rsi"] or now - state["last_rsi"] > timedelta(hours=2):
+            send(f"📉 RSI OVERSOLD\nRSI: {round(r,2)}\nBounce potential")
+            state["last_rsi"] = now
+
+# ======================
+# 1H VOLATILITY (MACRO SHOCK)
+# ======================
 def check_1h_vol():
-    data = get_data(interval="1h", period="3d")
-    if len(data) < 2:
-        return
-
+    data = get_data("1h", "3d")
     prev = data["Close"].iloc[-2]
     last = data["Close"].iloc[-1]
     move = pct(prev, last)
@@ -121,65 +125,40 @@ def check_1h_vol():
     now = datetime.now(TZ)
 
     if abs(move) >= VOL_1H_THRESHOLD:
-        if not state["last_1h_vol"] or now - state["last_1h_vol"] > timedelta(hours=1):
+        if not state["last_1h"] or now - state["last_1h"] > timedelta(hours=1):
             send(
-                f"⚠️ ABNORMAL 1H MOVE\n\n"
-                f"Move: {move}%\n"
-                f"WTI: {round(last,2)}\n\n"
-                f"Cause likely:\n"
-                f"• Macro repricing\n"
-                f"• Session liquidity\n"
-                f"• Headline risk"
+                f"🚨 MACRO SHOCK DETECTED\n\n"
+                f"1H Move: {move}%\nWTI: {round(last,2)}\n\n"
+                f"Risk-Off Conditions\n"
+                f"Likely Macro Event (Jobs / CPI / FOMC)"
             )
-            state["last_1h_vol"] = now
+            state["macro_lock"] = True
+            state["last_1h"] = now
 
 # ======================
-# RSI ALERTS
+# FALSE BREAKOUT (CONTROLLED)
 # ======================
-
-def rsi_alert():
-    data = get_data(interval="15m", period="2d")
-    close = data["Close"]
-    rsi = compute_rsi(close).iloc[-1]
-
-    now = datetime.now(TZ)
-
-    if rsi >= RSI_OVERBOUGHT:
-        if not state["last_rsi_alert"] or now - state["last_rsi_alert"] > timedelta(hours=2):
-            send(f"📈 RSI OVERBOUGHT\nRSI: {round(rsi,2)}\nRisk of pullback")
-            state["last_rsi_alert"] = now
-
-    if rsi <= RSI_OVERSOLD:
-        if not state["last_rsi_alert"] or now - state["last_rsi_alert"] > timedelta(hours=2):
-            send(f"📉 RSI OVERSOLD\nRSI: {round(rsi,2)}\nBounce possible")
-            state["last_rsi_alert"] = now
-
-# ======================
-# FALSE BREAKOUT (FIXED)
-# ======================
-
 def false_breakout():
-    data = get_data(interval="5m", period="2d")
-    prev_high = data["High"].iloc[-50:-1].max()
-    candle = data.iloc[-2]  # closed candle
+    data = get_data("5m", "2d")
+    level = data["High"].iloc[-50:-1].max()
+    candle = data.iloc[-2]
 
     now = datetime.now(TZ)
 
-    if state["false_break_time"] and now - state["false_break_time"] < timedelta(minutes=30):
+    if state["false_break"] and now - state["false_break"] < timedelta(minutes=45):
         return
 
-    if candle["High"] > prev_high and candle["Close"] < prev_high:
+    if candle["High"] > level and candle["Close"] < level:
         send(
-            f"⚠️ FALSE BREAKOUT CONFIRMED\n"
-            f"Liquidity sweep above {round(prev_high,2)}\n"
-            f"Rejection candle closed below"
+            f"⚠️ FALSE BREAKOUT\n"
+            f"Liquidity sweep above {round(level,2)}\n"
+            f"Price rejected"
         )
-        state["false_break_time"] = now
+        state["false_break"] = now
 
 # ======================
-# EIA DATA
+# EIA ACTUAL DATA
 # ======================
-
 def fetch_eia():
     url = (
         "https://api.eia.gov/v2/petroleum/stocks/data/"
@@ -197,7 +176,6 @@ def fetch_eia():
 # ======================
 # INVENTORY EVENTS
 # ======================
-
 def inventory(name, expected, is_eia=False):
     pre = get_data()["Close"].iloc[-1]
     send(f"🛢️ {name} RELEASE\nPre Price: {round(pre,2)}")
@@ -206,47 +184,60 @@ def inventory(name, expected, is_eia=False):
 
     post = get_data()["Close"].iloc[-1]
     actual = fetch_eia() if is_eia else expected
-
     bias = "📈 Bullish" if actual < expected else "📉 Bearish"
 
     send(
         f"📊 {name} SUMMARY\n\n"
-        f"Expected: {expected}M\n"
-        f"Actual: {actual}M\n\n"
-        f"Pre: {round(pre,2)}\n"
-        f"Post: {round(post,2)}\n\n"
+        f"Expected: {expected}M\nActual: {actual}M\n\n"
+        f"Pre: {round(pre,2)}\nPost: {round(post,2)}\n\n"
         f"{bias}"
     )
 
 # ======================
 # NEWS
 # ======================
-
 def check_news():
     feed = feedparser.parse(NEWS_URL)
-
     for e in feed.entries[:5]:
         published = datetime(*e.published_parsed[:6], tzinfo=pytz.UTC).astimezone(TZ)
-        if published > state["last_news_time"]:
+        if published > state["last_news"]:
             if any(k in e.title.lower() for k in NEWS_KEYWORDS):
                 send(f"🚨 ENERGY HEADLINE\n\n{e.title}")
-                state["last_news_time"] = published
+                state["last_news"] = published
+
+# ======================
+# DAILY MACRO BRIEF
+# ======================
+def daily_brief():
+    price = get_data()["Close"].iloc[-1]
+    send(
+        f"🛢️ DAILY CRUDE BRIEF (IST)\n\n"
+        f"WTI: {round(price,2)}\n\n"
+        f"Focus Today:\n"
+        f"• US Macro Data\n"
+        f"• Risk sentiment\n"
+        f"• Inventory expectations"
+    )
 
 # ======================
 # MAIN LOOP
 # ======================
-
 def main():
     send("🚀 Crude Master Bot LIVE (IST)")
+    last_brief = None
 
     while True:
         now = datetime.now(TZ)
 
         session_alerts(now)
-        check_1h_vol()
         rsi_alert()
         false_breakout()
+        check_1h_vol()
         check_news()
+
+        if now.hour == 9 and now.minute == 0 and last_brief != now.date():
+            daily_brief()
+            last_brief = now.date()
 
         if now.weekday() == 1 and now.hour == 20 and now.minute == 0:
             inventory("API Inventory", EXPECTED_API)
@@ -261,6 +252,5 @@ def main():
 # ======================
 # RUN
 # ======================
-
 if __name__ == "__main__":
     main()
